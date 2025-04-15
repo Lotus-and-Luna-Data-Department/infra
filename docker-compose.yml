@@ -1,0 +1,205 @@
+#version: "3.8"
+
+networks:
+  landl_db_network:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+  web_network:          ## changed: now external
+    external: true
+
+volumes:
+  postgres_data:
+  prefect_db_data:
+  letsencrypt_certs:    ## NEW OR CHANGED ##
+
+services:
+  ########################################################################
+  # (1) Main Production DB (Postgres)
+  ########################################################################
+  db:
+    image: postgres:13
+    restart: always
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${DB_USER_PROD}
+      POSTGRES_PASSWORD: ${DB_PASSWORD_PROD}
+      POSTGRES_DB: ${DB_NAME_PROD}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      LETSENCRYPT_DOMAIN: "${LETSENCRYPT_DOMAIN}"  # pass domain to container
+    ports:
+      - "5432:5432"
+    volumes:
+      - letsencrypt_certs:/letsencrypt:ro
+      
+      # Persistent data volume
+      - postgres_data:/var/lib/postgresql/data
+
+      # (A) Load schema files FIRST
+      - ./base/schemas/last_sync.sql:/docker-entrypoint-initdb.d/last_sync.sql:ro
+      - ./base/schemas/users.sql:/docker-entrypoint-initdb.d/users.sql:ro
+      
+      # (B) Mount custom configuration files
+      - ./config/db/postgresql.conf:/etc/postgres-config/postgresql.conf:ro
+      - ./config/pg_hba_main.conf:/etc/postgres-config/pg_hba.conf:ro
+
+      # (C) Copy SSL certificates
+      - ./copy_certs.sh:/docker-entrypoint-initdb.d/02_copy_certs.sh:ro
+      - ./docker/postgres-fallback-certs:/docker-entrypoint-initdb.d/fallback-certs:ro
+
+      # (D) Copy custom PostgreSQL configuration
+      - ./copy_configs.sh:/docker-entrypoint-initdb.d/03_copy_configs.sh:ro
+      
+      # (E) Initialize users AFTER the tables exist
+      - ./initialize_users.sh:/docker-entrypoint-initdb.d/04_initialize_users.sh:ro
+    networks:
+      - landl_db_network
+      # We don't need web_network for the DB unless you want Traefik to route to Postgres
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "pg_isready -h localhost -p 5432 -U ${DB_USER_PROD} -d ${DB_NAME_PROD}"
+      ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  ########################################################################
+  # (2) Prefect DB (Separate Postgres)
+  ########################################################################
+  prefect-db:
+    image: postgres:15
+    restart: always
+    env_file: .env
+    environment:
+      POSTGRES_USER: prefect
+      POSTGRES_PASSWORD: ${PREFECT_DB_PASSWORD}
+      POSTGRES_DB: prefect
+    volumes:
+      - prefect_db_data:/var/lib/postgresql/data
+      - ./config/prefect_db/postgresql.conf:/etc/postgres-config/postgresql.conf
+      - ./config/pg_hba_prefect.conf:/etc/postgres-config/pg_hba.conf
+      - ./copy_certs.sh:/docker-entrypoint-initdb.d/00_copy_certs.sh:ro
+      - ./docker/postgres-fallback-certs:/docker-entrypoint-initdb.d/fallback-certs:ro
+      - letsencrypt_certs:/letsencrypt:ro
+      - ./copy_configs.sh:/docker-entrypoint-initdb.d/copy_configs.sh
+    networks:
+      - landl_db_network
+    healthcheck:
+      test: [
+        "CMD-SHELL",
+        "pg_isready -h localhost -p 5432 -U prefect -d prefect"
+      ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  ########################################################################
+  # (3) Prefect Orion Server
+  ########################################################################
+  prefect-server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.prefect_server
+    command: prefect server start --host 0.0.0.0
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: "postgresql+asyncpg://prefect:${PREFECT_DB_PASSWORD}@prefect-db:5432/prefect"
+    ports:
+      - "4200:4200"
+    depends_on:
+      prefect-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - landl_db_network
+      - web_network        ## external web network added for Traefik routing
+    labels:               ## for Traefik routing
+      traefik.enable: "true"
+      traefik.http.routers.prefect.rule: "PathPrefix(`/prefect`)"
+      traefik.http.routers.prefect.entrypoints: "websecure"
+      traefik.http.routers.prefect.tls.certresolver: "myresolver"
+      traefik.http.services.prefect.loadbalancer.server.port: "4200"
+
+  ########################################################################
+  # (4) Ephemeral container that runs 'startup.sh'
+  ########################################################################
+  prefect-deployments:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+    restart: 'no'
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - ./base/schemas:/schemas
+    env_file: .env
+    environment:
+      ENV: production
+      PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_API_MODE: production
+      DB_HOST: ${DB_HOST_PROD}
+      DB_PORT: ${DB_PORT_PROD}
+      DB_USER: ${DB_USER_PROD}
+      DB_PASSWORD: ${DB_PASSWORD_PROD}
+      DB_NAME: ${DB_NAME_PROD}
+      PGSSLMODE: require
+    command: ["bash", "/app/startup.sh"]
+    networks:
+      - landl_db_network
+
+  ########################################################################
+  # (5) "app" container – no main_app.py, so we keep it simple
+  ########################################################################
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    depends_on:
+      - db
+      - prefect-server
+    env_file: .env
+    environment:
+      ENV: production
+      PREFECT_API_URL: http://prefect-server:4200/api
+      PREFECT_API_MODE: production
+      DB_HOST: ${DB_HOST_PROD}
+      DB_PORT: ${DB_PORT_PROD}
+      DB_USER: ${DB_USER_PROD}
+      DB_PASSWORD: ${DB_PASSWORD_PROD}
+      DB_NAME: ${DB_NAME_PROD}
+      PGSSLMODE: require
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./base/schemas:/schemas
+    networks:
+      - landl_db_network
+
+  ########################################################################
+  # (6) Single Prefect Worker
+  ########################################################################
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+    command: prefect worker start --pool default --type process
+    volumes:
+      - ./:/app
+    networks:
+      - landl_db_network
