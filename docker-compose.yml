@@ -11,14 +11,18 @@ networks:
 volumes:
   postgres_data:
   prefect_db_data:
-  letsencrypt_certs:    ## NEW OR CHANGED ##
+  letsencrypt_certs:
+    external: true
+    name: letsencrypt_certs  
 
 services:
   ########################################################################
   # (1) Main Production DB (Postgres)
   ########################################################################
   db:
-    image: postgres:13
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.postgres
     restart: always
     env_file: .env
     environment:
@@ -30,7 +34,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - letsencrypt_certs:/letsencrypt:ro
+      - letsencrypt_certs:/letsencrypt
       
       # Persistent data volume
       - postgres_data:/var/lib/postgresql/data
@@ -69,7 +73,9 @@ services:
   # (2) Prefect DB (Separate Postgres)
   ########################################################################
   prefect-db:
-    image: postgres:15
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.postgres   
     restart: always
     env_file: .env
     environment:
@@ -82,7 +88,7 @@ services:
       - ./config/pg_hba_prefect.conf:/etc/postgres-config/pg_hba.conf
       - ./copy_certs.sh:/docker-entrypoint-initdb.d/00_copy_certs.sh:ro
       - ./docker/postgres-fallback-certs:/docker-entrypoint-initdb.d/fallback-certs:ro
-      - letsencrypt_certs:/letsencrypt:ro
+      - letsencrypt_certs:/letsencrypt
       - ./copy_configs.sh:/docker-entrypoint-initdb.d/copy_configs.sh
     networks:
       - landl_db_network
