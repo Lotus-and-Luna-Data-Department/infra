@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-compose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose files
+        run: |
+          docker-compose -f docker-compose.yml \
+                         -f docker-compose.web.yml \
+                         config --quiet
