@@ -4,7 +4,8 @@ networks:
 
 volumes:
   letsencrypt_certs:
-    driver: local
+    external: true
+    name: letsencrypt_certs
 
 services:
   ########################################################################
@@ -23,18 +24,9 @@ services:
       - letsencrypt_certs:/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
     command:
-      - --log.level=INFO
-      - --api.dashboard=true
-      # Entry points
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-      - --providers.docker=true
-      # Let's Encrypt: use the staging endpoint to avoid rate limits
-      - --certificatesresolvers.myresolver.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
-      - --certificatesresolvers.myresolver.acme.httpchallenge=true
-      - --certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web
-      - --certificatesresolvers.myresolver.acme.email=admin@lotusandluna.com
-      - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
+      - /bin/sh
+      - -c
+      - "traefik --log.level=INFO --api.dashboard=true --entrypoints.web.address=:80 --entrypoints.websecure.address=:443 --providers.docker=true --certificatesresolvers.myresolver.acme.caserver=https://acme-v02.api.letsencrypt.org/directory --certificatesresolvers.myresolver.acme.httpchallenge=true --certificatesresolvers.myresolver.acme.httpchallenge.entrypoint=web --certificatesresolvers.myresolver.acme.email=admin@lotusandluna.com --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json & pid=$!; sleep 5; chmod 644 /letsencrypt/acme.json 2>/dev/null || true; wait $pid"
     labels:
       - "traefik.enable=true"
 
@@ -51,16 +43,14 @@ services:
     env_file: .env
     labels:
       - "traefik.enable=true"
-      # HTTPS route
-      - "traefik.http.routers.landing.rule=Host(`data.lotusandluna.com`)"
-      - "traefik.http.routers.landing.entrypoints=websecure"
-      - "traefik.http.routers.landing.tls.certresolver=myresolver"
-      - "traefik.http.services.landing.loadbalancer.server.port=8000"
-
-      # HTTP router that redirects to HTTPS
       - "traefik.http.routers.landing-insecure.rule=Host(`data.lotusandluna.com`)"
       - "traefik.http.routers.landing-insecure.entrypoints=web"
       - "traefik.http.routers.landing-insecure.middlewares=redirect-to-https"
+      - "traefik.http.routers.landing.rule=Host(`data.lotusandluna.com`)"
+      - "traefik.http.routers.landing.entrypoints=websecure"
+      - "traefik.http.routers.landing.tls=true"
+      - "traefik.http.routers.landing.tls.certresolver=myresolver"
+      - "traefik.http.services.landing.loadbalancer.server.port=8000"
       - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
